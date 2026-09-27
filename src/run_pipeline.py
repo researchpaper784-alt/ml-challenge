@@ -64,18 +64,30 @@ def dump(obj, path):
 
 
 def prepare(split_dir, cfg):
-    """normalize -> block -> features. Returns everything downstream steps need."""
+    """normalize -> block -> features. Returns everything downstream steps need.
+
+    `src` (the raw, un-normalized sources) is deleted as soon as s1/pool are built:
+    normalize_frame() already keeps the raw text columns, so holding both is pure
+    duplication of the largest thing in memory. At real-dataset scale (millions of
+    rows) that duplication is the difference between fitting in this box's RAM and not.
+    """
+    import gc
     t0 = time.time()
     src = io.load_sources(split_dir)
     s1 = normalize_frame(src["source1"]).reset_index(drop=True)
-    pool = normalize_frame(pd.concat([src["source2"], src["source3"]], ignore_index=True)).reset_index(drop=True)
+    pool_raw = pd.concat([src["source2"], src["source3"]], ignore_index=True)
+    del src
+    gc.collect()
+    pool = normalize_frame(pool_raw).reset_index(drop=True)
+    del pool_raw
+    gc.collect()
     print(f"[prep] normalized {len(s1):,} S1 / {len(pool):,} S2+S3 in {time.time()-t0:.1f}s")
     ix = build_index(s1, pool, cfg["blocking"])
     cands = generate_candidates(ix, cfg["blocking"])
     print(f"[prep] blocking -> {len(cands):,} candidate pairs in {time.time()-t0:.1f}s")
     F = pair_features(ix, cands)
     print(f"[prep] features {F.shape} in {time.time()-t0:.1f}s")
-    return src, s1, pool, ix, cands, F
+    return s1, pool, ix, cands, F
 
 
 def cand_lists(cands):
@@ -116,7 +128,7 @@ def cmd_train(args, cfg):
     art = cfg["paths"]["artifacts_dir"]
     d = os.path.join(cfg["paths"]["dataset_dir"], "train")
     truth_all = io.load_ground_truth(d)
-    src, s1, pool, ix, cands, F = prepare(d, cfg)
+    s1, pool, ix, cands, F = prepare(d, cfg)
     s1_ids = s1["entity_id"].tolist()
     truth = {e: truth_all.get(e, set()) for e in s1_ids}       # every S1 entity, singletons included
     country = dict(zip(s1["entity_id"], s1["country"]))
@@ -176,7 +188,7 @@ def cmd_predict(args, cfg):
     model: PairModel = joblib.load(os.path.join(art, "model.joblib"))
     with open(os.path.join(art, "decision.json")) as f:
         params = json.load(f)
-    src, s1, pool, ix, cands, F = prepare(d, cfg)
+    s1, pool, ix, cands, F = prepare(d, cfg)
     p = model.predict_proba(F[feature_columns(F)]) if len(cands) else np.array([])
     matches = decide(cands["s1_id"].to_numpy(), cands["cand_id"].to_numpy(), p, params)
     s1_ids = s1["entity_id"].tolist()
@@ -210,7 +222,7 @@ def cmd_holdout_country(args, cfg):
     seed = cfg["seed"]
     d = os.path.join(cfg["paths"]["dataset_dir"], "train")
     truth_all = io.load_ground_truth(d)
-    src, s1, pool, ix, cands, F = prepare(d, cfg)
+    s1, pool, ix, cands, F = prepare(d, cfg)
     truth = {e: truth_all.get(e, set()) for e in s1["entity_id"]}
     country = dict(zip(s1["entity_id"], s1["country"]))
     y = label_pairs(cands, truth)
