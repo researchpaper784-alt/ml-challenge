@@ -89,12 +89,18 @@ def _row_topk(indices: np.ndarray, data: np.ndarray, kk: int, min_score: float):
 
 def _topk_sparse(A: sparse.csr_matrix, B: sparse.csr_matrix, rows: np.ndarray, cols: np.ndarray,
                  k: int, chunk_cap: int, min_score: float = 1e-6):
-    """Yield (s1_row, pool_col, score, rank) for top-k cosine of A[rows] vs B[cols].
+    """Yield one (s1_rows, pool_cols, scores, ranks) NumPy-array tuple per row-chunk of
+    top-k cosine hits for A[rows] vs B[cols].
 
     Stays sparse end to end: A[r] @ Bt is a sparse product (cost tracks actual
     shared-token overlap, not rows*cols), and top-k is taken from each row's nonzero
     (indices, data) slice directly — never a dense (chunk_rows, len(cols)) array, which
     at millions of pool columns would blow up memory/time regardless of chunk size.
+
+    Yields per-chunk arrays rather than one Python scalar tuple per hit: at tens of
+    millions of candidate pairs, boxing each (row, col, score, rank) as individual
+    Python objects costs far more memory than the actual data (measured, live: this was
+    the dominant cost in a run that otherwise had every other stage under control).
     """
     if len(rows) == 0 or len(cols) == 0 or k <= 0:
         return
@@ -105,11 +111,18 @@ def _topk_sparse(A: sparse.csr_matrix, B: sparse.csr_matrix, rows: np.ndarray, c
         r = rows[st:st + chunk]
         S = (A[r] @ Bt).tocsr()
         indptr, indices, data = S.indptr, S.indices, S.data
+        out_i, out_j, out_s, out_rk = [], [], [], []
         for i in range(len(r)):
             lo, hi = indptr[i], indptr[i + 1]
             idx, sc = _row_topk(indices[lo:hi], data[lo:hi], kk, min_score)
-            for rank, (j, s) in enumerate(zip(idx, sc), 1):
-                yield r[i], cols[j], float(s), rank
+            if idx.size:
+                out_i.append(np.full(idx.size, r[i], dtype=np.int64))
+                out_j.append(cols[idx])
+                out_s.append(sc.astype(np.float32))
+                out_rk.append(np.arange(1, idx.size + 1, dtype=np.int32))
+        if out_i:
+            yield (np.concatenate(out_i), np.concatenate(out_j),
+                  np.concatenate(out_s), np.concatenate(out_rk))
 
 
 def _country_groups(ix: BlockingIndex, mode: str):
@@ -135,7 +148,8 @@ def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
     matches or the address shares >=2 rare tokens. Kept sparse end to end (see
     `_topk_sparse`): combining three separate sparse products per row means working
     from each row's nonzero (index -> value) map instead of a dense (chunk, len(cols))
-    array, which at millions of pool columns is not just slow but not allocatable."""
+    array, which at millions of pool columns is not just slow but not allocatable.
+    Yields one array-tuple per row-chunk (see `_topk_sparse` for why)."""
     n = ix.token_idf["__N__"]
     max_df = cfg["rare_token_max_df"]
     idf_thresh = np.log((1 + n) / (1 + max(2, max_df * n))) + 1
@@ -156,6 +170,7 @@ def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
         Sname = (s1n[r] @ PnT).tocsr()
         Sacnt = (s1a[r] @ PaT).tocsr()
         Saw = (s1a[r] @ PaTw).tocsr()
+        out_i, out_j, out_s, out_rk = [], [], [], []
         for i in range(len(r)):
             name_row = _sparse_row_dict(Sname, i)
             aw_row = _sparse_row_dict(Saw, i)
@@ -170,12 +185,20 @@ def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
                     continue
                 if sc > 0:
                     scored[j] = sc
-            for rank, (j, sc) in enumerate(sorted(scored.items(), key=lambda kv: -kv[1])[:k], 1):
-                yield r[i], cols[j], float(sc), rank
+            top = sorted(scored.items(), key=lambda kv: -kv[1])[:k]
+            if top:
+                out_i.append(np.full(len(top), r[i], dtype=np.int64))
+                out_j.append(cols[np.array([j for j, _ in top], dtype=np.int64)])
+                out_s.append(np.array([sc for _, sc in top], dtype=np.float32))
+                out_rk.append(np.arange(1, len(top) + 1, dtype=np.int32))
+        if out_i:
+            yield (np.concatenate(out_i), np.concatenate(out_j),
+                  np.concatenate(out_s), np.concatenate(out_rk))
 
 
 def _key_blocks(ix: BlockingIndex, cfg: dict):
-    """Exact-key blocks that rescue typo-heavy pairs the vector indexes rank low."""
+    """Exact-key blocks that rescue typo-heavy pairs the vector indexes rank low.
+    Yields one array-tuple per row-chunk (see `_topk_sparse` for why)."""
     def keys(df):
         out = []
         for r in df.itertuples(index=False):
@@ -195,43 +218,74 @@ def _key_blocks(ix: BlockingIndex, cfg: dict):
         for k in ks:
             pool_map[k].append(j)
     cap = cfg["key_block_max_size"]
-    for i, ks in enumerate(keys(ix.s1)):
-        hits = defaultdict(int)
-        for k in ks:
-            js = pool_map.get(k, ())
-            if 0 < len(js) <= cap:
-                for j in js:
-                    hits[j] += 1
-        for j, c in hits.items():
-            yield i, j, float(c), 1
+    s1_keys = keys(ix.s1)
+    chunk = max(1, min(cfg.get("chunk_size", 2000), 5000))
+    for st in range(0, len(s1_keys), chunk):
+        out_i, out_j, out_s, out_rk = [], [], [], []
+        for i in range(st, min(st + chunk, len(s1_keys))):
+            hits = defaultdict(int)
+            for k in s1_keys[i]:
+                js = pool_map.get(k, ())
+                if 0 < len(js) <= cap:
+                    for j in js:
+                        hits[j] += 1
+            if hits:
+                out_i.append(np.full(len(hits), i, dtype=np.int64))
+                out_j.append(np.fromiter(hits.keys(), dtype=np.int64, count=len(hits)))
+                out_s.append(np.fromiter(hits.values(), dtype=np.float32, count=len(hits)))
+                out_rk.append(np.ones(len(hits), dtype=np.int32))
+        if out_i:
+            yield (np.concatenate(out_i), np.concatenate(out_j),
+                  np.concatenate(out_s), np.concatenate(out_rk))
+
+
+def _index_frame(name: str, chunked_iters: list) -> pd.DataFrame | None:
+    """Concatenate one index's per-chunk (i, j, score, rank) arrays into a DataFrame.
+
+    Columnar (NumPy-backed) accumulation, not a Python dict keyed by every candidate
+    pair: at tens of millions of pairs, a dict entry's own object overhead (~200+ bytes,
+    independent of the four numbers it holds) was the dominant memory cost in this
+    pipeline — enough on its own to exhaust the box's RAM before blocking finished.
+    """
+    i_parts, j_parts, s_parts, r_parts = [], [], [], []
+    for it in chunked_iters:
+        for i_arr, j_arr, s_arr, r_arr in it:
+            i_parts.append(i_arr); j_parts.append(j_arr); s_parts.append(s_arr); r_parts.append(r_arr)
+    if not i_parts:
+        return None
+    return pd.DataFrame({
+        "s1_idx": np.concatenate(i_parts),
+        "pool_idx": np.concatenate(j_parts),
+        f"blk_{name}_score": np.concatenate(s_parts),
+        f"blk_{name}_rank": np.concatenate(r_parts),
+    })
 
 
 def generate_candidates(ix: BlockingIndex, cfg: dict) -> pd.DataFrame:
     """Returns one row per (s1_id, cand_id) with per-index score/rank columns (NaN = not produced)."""
-    recs = defaultdict(dict)
-
-    def add(name, it):
-        for i, j, s, rk in it:
-            d = recs[(i, j)]
-            if s > d.get(f"blk_{name}_score", -1):
-                d[f"blk_{name}_score"], d[f"blk_{name}_rank"] = s, rk
-
     cap = cfg["chunk_size"]
+    char_iters, word_iters, rare_iters = [], [], []
     for rows, cols in _country_groups(ix, cfg["country_mode"]):
-        add("char", _topk_sparse(ix.s1_char, ix.pool_char, rows, cols, cfg["char_tfidf_k"], cap))
-        add("word", _topk_sparse(ix.s1_word, ix.pool_word, rows, cols, cfg["word_tfidf_k"], cap))
-        add("rare", _rare_token_index(ix, cfg, rows, cols))
-    if cfg["country_mode"] != "all" and cfg.get("cross_country_k", 0) > 0:
-        add("xc", _topk_sparse(ix.s1_char, ix.pool_char, np.arange(len(ix.s1)),
-                               np.arange(len(ix.pool)), cfg["cross_country_k"], cap))
-    add("key", _key_blocks(ix, cfg))
+        char_iters.append(_topk_sparse(ix.s1_char, ix.pool_char, rows, cols, cfg["char_tfidf_k"], cap))
+        word_iters.append(_topk_sparse(ix.s1_word, ix.pool_word, rows, cols, cfg["word_tfidf_k"], cap))
+        rare_iters.append(_rare_token_index(ix, cfg, rows, cols))
 
-    if not recs:
+    frames = {"char": _index_frame("char", char_iters),
+             "word": _index_frame("word", word_iters),
+             "rare": _index_frame("rare", rare_iters)}
+    if cfg["country_mode"] != "all" and cfg.get("cross_country_k", 0) > 0:
+        frames["xc"] = _index_frame("xc", [_topk_sparse(
+            ix.s1_char, ix.pool_char, np.arange(len(ix.s1)), np.arange(len(ix.pool)),
+            cfg["cross_country_k"], cap)])
+    frames["key"] = _index_frame("key", [_key_blocks(ix, cfg)])
+    frames = {k: v for k, v in frames.items() if v is not None}
+
+    if not frames:
         return pd.DataFrame(columns=["s1_idx", "pool_idx", "s1_id", "cand_id"])
-    keys = list(recs)
-    out = pd.DataFrame([recs[k] for k in keys])
-    out.insert(0, "pool_idx", [k[1] for k in keys])
-    out.insert(0, "s1_idx", [k[0] for k in keys])
+    out = None
+    for df in frames.values():
+        out = df if out is None else out.merge(df, on=["s1_idx", "pool_idx"], how="outer")
+
     out.insert(2, "s1_id", ix.s1["entity_id"].to_numpy()[out["s1_idx"]])
     out.insert(3, "cand_id", ix.pool["entity_id"].to_numpy()[out["pool_idx"]])
     for name in ("char", "word", "rare", "xc", "key"):      # fixed schema across splits
