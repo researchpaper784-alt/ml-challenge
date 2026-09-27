@@ -1,0 +1,42 @@
+# Every leaderboard upload should be traceable to a copy of this file (config hash is logged).
+seed: 42
+
+paths:
+  dataset_dir: dataset          # contains train/ and test/
+  output_dir: output
+  artifacts_dir: artifacts
+
+blocking:
+  country_mode: same_first      # same_first | all   (same_first falls back to all when pool is empty)
+  cross_country_k: 3            # extra top-k taken from the full pool even in same_first mode
+  char_tfidf_k: 25
+  word_tfidf_k: 15
+  char_ngram_range: [3, 5]
+  rare_token_max_df: 0.01       # tokens in more than this fraction of pool docs are not indexed
+  rare_token_k: 15
+  key_block_max_size: 50        # exact-key blocks bigger than this are skipped (too generic)
+  chunk_size: 2000
+
+pairs:
+  cv_folds: 5
+  max_neg_per_entity: 40        # hardest negatives kept per S1 entity (by blocking score)
+
+model:
+  backend: lightgbm             # lightgbm | sklearn_hgb (fallback for environments without lightgbm)
+  params:
+    n_estimators: 600
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 20
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+
+decision:
+  tau_grid: [0.05, 0.95, 0.025]  # start, stop, step
+  margin_grid: [null, 0.1, 0.2, 0.3, 0.5]
+  per_source_cap_grid: [null, 1]
+  source_offset_grid: [0.0, 0.05, -0.05]   # tau_S3 = tau + offset
+  emit_bar_grid: [0.0, 0.05, 0.1]    # extra bar the best candidate must clear before an entity emits
+  plateau_halfwidth: 2           # smooth the tau curve over +/- this many grid steps
