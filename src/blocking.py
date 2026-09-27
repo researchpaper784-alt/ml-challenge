@@ -4,6 +4,7 @@ The output of `generate_candidates` IS candidate_pairs.tsv: it is exactly the se
 """
 from __future__ import annotations
 
+import resource
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -11,6 +12,11 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+
+
+def _mem(label: str) -> None:
+    """Peak RSS so far, for pinpointing which step of blocking dominates memory at scale."""
+    print(f"[mem] {label}: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f}MB", flush=True)
 
 
 
@@ -46,15 +52,18 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
     exhausting memory before a single candidate is generated, dominated by n-grams/
     tokens that appear once or twice and carry no real blocking signal anyway.
     """
+    _mem("build_index start")
     lo, hi = cfg["char_ngram_range"]
     char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(lo, hi), min_df=1,
                                max_features=cfg.get("char_max_features"),
                                sublinear_tf=True, dtype=np.float32)
     char_vec.fit(pd.concat([s1["name_core"], pool["name_core"]]))
+    _mem(f"char_vec fit (vocab={len(char_vec.vocabulary_):,})")
     word_vec = TfidfVectorizer(analyzer="word", token_pattern=r"(?u)\b\w+\b", min_df=1,
                                max_features=cfg.get("word_max_features"),
                                sublinear_tf=True, dtype=np.float32)
     word_vec.fit(pd.concat([_word_doc(s1), _word_doc(pool)]))
+    _mem(f"word_vec fit (vocab={len(word_vec.vocabulary_):,})")
 
     # token IDF over name_core + addr_key of all records (used by rare-token index and features).
     # Tokens appearing exactly once can never produce a *shared* rare-token match between two
@@ -67,6 +76,7 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
             dfc[t] += 1
     token_idf = {t: float(np.log((1 + n) / (1 + c)) + 1) for t, c in dfc.items() if c > 1}
     token_idf["__N__"] = n
+    _mem(f"token_idf built ({len(token_idf):,} tokens)")
 
     # Rare-token vectorization, done once here rather than inside _rare_token_index: that
     # function used to be called once per country group and rebuilt + re-transformed this
@@ -76,6 +86,7 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
     max_df = cfg["rare_token_max_df"]
     idf_thresh = np.log((1 + n) / (1 + max(2, max_df * n))) + 1
     rare = sorted(t for t, v in token_idf.items() if t != "__N__" and v >= idf_thresh)
+    _mem(f"rare token list built ({len(rare):,} tokens)")
     rare_idf_diag = s1_rare_name = pool_rare_name = s1_rare_addr = pool_rare_addr = None
     if rare:
         rare_cv = CountVectorizer(vocabulary=rare, binary=True, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
@@ -84,13 +95,18 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
         pool_rare_name = rare_cv.transform(pool["name_core"]).tocsr()
         s1_rare_addr = rare_cv.transform(s1["addr_key"]).tocsr()
         pool_rare_addr = rare_cv.transform(pool["addr_key"]).tocsr()
+    _mem("rare-token matrices transformed")
+
+    s1_char = char_vec.transform(s1["name_core"]).tocsr()
+    pool_char = char_vec.transform(pool["name_core"]).tocsr()
+    _mem(f"char matrices transformed (pool nnz={pool_char.nnz:,})")
+    s1_word = word_vec.transform(_word_doc(s1)).tocsr()
+    pool_word = word_vec.transform(_word_doc(pool)).tocsr()
+    _mem(f"word matrices transformed (pool nnz={pool_word.nnz:,})")
 
     return BlockingIndex(
         s1=s1, pool=pool, char_vec=char_vec, word_vec=word_vec,
-        s1_char=char_vec.transform(s1["name_core"]).tocsr(),
-        pool_char=char_vec.transform(pool["name_core"]).tocsr(),
-        s1_word=word_vec.transform(_word_doc(s1)).tocsr(),
-        pool_word=word_vec.transform(_word_doc(pool)).tocsr(),
+        s1_char=s1_char, pool_char=pool_char, s1_word=s1_word, pool_word=pool_word,
         token_idf=token_idf,
         rare_idf_diag=rare_idf_diag, s1_rare_name=s1_rare_name, pool_rare_name=pool_rare_name,
         s1_rare_addr=s1_rare_addr, pool_rare_addr=pool_rare_addr,
@@ -286,6 +302,7 @@ def _index_frame(name: str, chunked_iters: list) -> pd.DataFrame | None:
 
 def generate_candidates(ix: BlockingIndex, cfg: dict) -> pd.DataFrame:
     """Returns one row per (s1_id, cand_id) with per-index score/rank columns (NaN = not produced)."""
+    _mem("generate_candidates start")
     cap = cfg["chunk_size"]
     char_iters, word_iters, rare_iters = [], [], []
     for rows, cols in _country_groups(ix, cfg["country_mode"]):
@@ -293,21 +310,28 @@ def generate_candidates(ix: BlockingIndex, cfg: dict) -> pd.DataFrame:
         word_iters.append(_topk_sparse(ix.s1_word, ix.pool_word, rows, cols, cfg["word_tfidf_k"], cap))
         rare_iters.append(_rare_token_index(ix, cfg, rows, cols))
 
-    frames = {"char": _index_frame("char", char_iters),
-             "word": _index_frame("word", word_iters),
-             "rare": _index_frame("rare", rare_iters)}
+    frames = {}
+    frames["char"] = _index_frame("char", char_iters)
+    _mem(f"char index frame built ({0 if frames['char'] is None else len(frames['char']):,} rows)")
+    frames["word"] = _index_frame("word", word_iters)
+    _mem(f"word index frame built ({0 if frames['word'] is None else len(frames['word']):,} rows)")
+    frames["rare"] = _index_frame("rare", rare_iters)
+    _mem(f"rare index frame built ({0 if frames['rare'] is None else len(frames['rare']):,} rows)")
     if cfg["country_mode"] != "all" and cfg.get("cross_country_k", 0) > 0:
         frames["xc"] = _index_frame("xc", [_topk_sparse(
             ix.s1_char, ix.pool_char, np.arange(len(ix.s1)), np.arange(len(ix.pool)),
             cfg["cross_country_k"], cap)])
+        _mem(f"xc index frame built ({0 if frames['xc'] is None else len(frames['xc']):,} rows)")
     frames["key"] = _index_frame("key", [_key_blocks(ix, cfg)])
+    _mem(f"key index frame built ({0 if frames['key'] is None else len(frames['key']):,} rows)")
     frames = {k: v for k, v in frames.items() if v is not None}
 
     if not frames:
         return pd.DataFrame(columns=["s1_idx", "pool_idx", "s1_id", "cand_id"])
     out = None
-    for df in frames.values():
+    for name, df in frames.items():
         out = df if out is None else out.merge(df, on=["s1_idx", "pool_idx"], how="outer")
+        _mem(f"merged {name} -> {len(out):,} rows")
 
     out.insert(2, "s1_id", ix.s1["entity_id"].to_numpy()[out["s1_idx"]])
     out.insert(3, "cand_id", ix.pool["entity_id"].to_numpy()[out["pool_idx"]])
