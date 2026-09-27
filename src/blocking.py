@@ -25,6 +25,11 @@ class BlockingIndex:
     s1_word: sparse.csr_matrix
     pool_word: sparse.csr_matrix
     token_idf: dict
+    rare_idf_diag: sparse.dia_matrix | None
+    s1_rare_name: sparse.csr_matrix | None
+    pool_rare_name: sparse.csr_matrix | None
+    s1_rare_addr: sparse.csr_matrix | None
+    pool_rare_addr: sparse.csr_matrix | None
 
 
 def _word_doc(df: pd.DataFrame) -> pd.Series:
@@ -63,6 +68,23 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
     token_idf = {t: float(np.log((1 + n) / (1 + c)) + 1) for t, c in dfc.items() if c > 1}
     token_idf["__N__"] = n
 
+    # Rare-token vectorization, done once here rather than inside _rare_token_index: that
+    # function used to be called once per country group and rebuilt + re-transformed this
+    # over the FULL s1/pool corpus on every single call (the country subsetting only
+    # happened afterwards, on the already-transformed matrices) — for N country groups that's
+    # N redundant full-corpus CountVectorizer transforms, needlessly multiplying peak memory.
+    max_df = cfg["rare_token_max_df"]
+    idf_thresh = np.log((1 + n) / (1 + max(2, max_df * n))) + 1
+    rare = sorted(t for t, v in token_idf.items() if t != "__N__" and v >= idf_thresh)
+    rare_idf_diag = s1_rare_name = pool_rare_name = s1_rare_addr = pool_rare_addr = None
+    if rare:
+        rare_cv = CountVectorizer(vocabulary=rare, binary=True, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
+        rare_idf_diag = sparse.diags(np.array([token_idf[t] for t in rare], dtype=np.float32))
+        s1_rare_name = rare_cv.transform(s1["name_core"]).tocsr()
+        pool_rare_name = rare_cv.transform(pool["name_core"]).tocsr()
+        s1_rare_addr = rare_cv.transform(s1["addr_key"]).tocsr()
+        pool_rare_addr = rare_cv.transform(pool["addr_key"]).tocsr()
+
     return BlockingIndex(
         s1=s1, pool=pool, char_vec=char_vec, word_vec=word_vec,
         s1_char=char_vec.transform(s1["name_core"]).tocsr(),
@@ -70,6 +92,8 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
         s1_word=word_vec.transform(_word_doc(s1)).tocsr(),
         pool_word=word_vec.transform(_word_doc(pool)).tocsr(),
         token_idf=token_idf,
+        rare_idf_diag=rare_idf_diag, s1_rare_name=s1_rare_name, pool_rare_name=pool_rare_name,
+        s1_rare_addr=s1_rare_addr, pool_rare_addr=pool_rare_addr,
     )
 
 
@@ -149,18 +173,17 @@ def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
     `_topk_sparse`): combining three separate sparse products per row means working
     from each row's nonzero (index -> value) map instead of a dense (chunk, len(cols))
     array, which at millions of pool columns is not just slow but not allocatable.
-    Yields one array-tuple per row-chunk (see `_topk_sparse` for why)."""
-    n = ix.token_idf["__N__"]
-    max_df = cfg["rare_token_max_df"]
-    idf_thresh = np.log((1 + n) / (1 + max(2, max_df * n))) + 1
-    rare = sorted(t for t, v in ix.token_idf.items() if t != "__N__" and v >= idf_thresh)
-    if not rare:
+    Yields one array-tuple per row-chunk (see `_topk_sparse` for why).
+
+    The rare-token CountVectorizer transforms are precomputed once in build_index, not
+    here: this function runs once per country group, and redoing a full-corpus transform
+    on every call multiplied peak memory by the number of country groups for no reason.
+    """
+    if ix.s1_rare_name is None:
         return
-    cv = CountVectorizer(vocabulary=rare, binary=True, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
-    w = sparse.diags(np.array([ix.token_idf[t] for t in rare], dtype=np.float32))
-    s1n, pn = cv.transform(ix.s1["name_core"]), cv.transform(ix.pool["name_core"])
-    s1a, pa = cv.transform(ix.s1["addr_key"]), cv.transform(ix.pool["addr_key"])
     k = cfg["rare_token_k"]
+    w = ix.rare_idf_diag
+    s1n, pn, s1a, pa = ix.s1_rare_name, ix.pool_rare_name, ix.s1_rare_addr, ix.pool_rare_addr
     PnT = (pn[cols] @ w).T.tocsr()
     PaT = pa[cols].T.tocsr()
     PaTw = (pa[cols] @ w).T.tocsr()
