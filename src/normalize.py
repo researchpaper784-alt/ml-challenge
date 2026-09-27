@@ -197,12 +197,19 @@ def normalize_frame(df: pd.DataFrame, chunk_size: int = 50_000, n_jobs: int | No
         return pd.concat([df, names_df, addrs_df, country_norm], axis=1)
 
     import os
+    import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
     chunks = [df.iloc[i:i + chunk_size] for i in range(0, n, chunk_size)]
     n_jobs = n_jobs or min(4, os.cpu_count() or 1, len(chunks))
     results = [None] * len(chunks)
-    with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+    # spawn, not the platform default fork: fork would hand every worker a
+    # copy-on-write snapshot of this process's *entire* memory (including whatever
+    # multi-GB frame the caller already holds), which then balloons for real as each
+    # worker's own refcounting touches those inherited pages. spawn starts each
+    # worker as a fresh interpreter that only ever receives the pickled chunk args.
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as ex:
         futs = {ex.submit(_normalize_chunk, c["business_name"].tolist(),
                           c["business_address"].tolist(), c["country"].tolist()): i
                for i, c in enumerate(chunks)}
