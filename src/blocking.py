@@ -33,23 +33,34 @@ def _word_doc(df: pd.DataFrame) -> pd.Series:
 
 def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingIndex:
     """Vectorizers are fit on this split's own corpus (S1 + pool); identical procedure for
-    train/val and test, so feature scales are comparable."""
+    train/val and test, so feature scales are comparable.
+
+    `max_features` caps each vectorizer's vocabulary to its top-N terms by corpus
+    frequency (sklearn's own ranking) — at real-dataset scale (millions of documents,
+    multiple scripts), an uncapped min_df=1 vocabulary balloons to the point of
+    exhausting memory before a single candidate is generated, dominated by n-grams/
+    tokens that appear once or twice and carry no real blocking signal anyway.
+    """
     lo, hi = cfg["char_ngram_range"]
     char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(lo, hi), min_df=1,
+                               max_features=cfg.get("char_max_features"),
                                sublinear_tf=True, dtype=np.float32)
     char_vec.fit(pd.concat([s1["name_core"], pool["name_core"]]))
     word_vec = TfidfVectorizer(analyzer="word", token_pattern=r"(?u)\b\w+\b", min_df=1,
+                               max_features=cfg.get("word_max_features"),
                                sublinear_tf=True, dtype=np.float32)
     word_vec.fit(pd.concat([_word_doc(s1), _word_doc(pool)]))
 
-    # token IDF over name_core + addr_key of all records (used by rare-token index and features)
+    # token IDF over name_core + addr_key of all records (used by rare-token index and features).
+    # Tokens appearing exactly once can never produce a *shared* rare-token match between two
+    # records, so they're pure vocabulary bloat here; dropping them is a no-op for recall.
     docs = pd.concat([s1["name_core"] + " " + s1["addr_key"], pool["name_core"] + " " + pool["addr_key"]])
     n = len(docs)
     dfc = defaultdict(int)
     for d in docs:
         for t in set(d.split()):
             dfc[t] += 1
-    token_idf = {t: float(np.log((1 + n) / (1 + c)) + 1) for t, c in dfc.items()}
+    token_idf = {t: float(np.log((1 + n) / (1 + c)) + 1) for t, c in dfc.items() if c > 1}
     token_idf["__N__"] = n
 
     return BlockingIndex(

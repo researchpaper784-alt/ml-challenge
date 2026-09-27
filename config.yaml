@@ -12,6 +12,10 @@ blocking:
   char_tfidf_k: 25
   word_tfidf_k: 15
   char_ngram_range: [3, 5]
+  char_max_features: 500000     # caps char n-gram vocab (top-N by corpus frequency); null = unbounded
+  word_max_features: 300000     # caps word vocab; at multi-million-row/multi-script scale an
+                                 # uncapped (min_df=1) vocabulary exhausts memory before any
+                                 # candidate is generated, dominated by n-grams seen once or twice
   rare_token_max_df: 0.01       # tokens in more than this fraction of pool docs are not indexed
   rare_token_k: 15
   key_block_max_size: 50        # exact-key blocks bigger than this are skipped (too generic)
