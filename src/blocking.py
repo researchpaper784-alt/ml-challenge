@@ -62,25 +62,43 @@ def build_index(s1: pd.DataFrame, pool: pd.DataFrame, cfg: dict) -> BlockingInde
     )
 
 
+def _row_topk(indices: np.ndarray, data: np.ndarray, kk: int, min_score: float):
+    """Top-k (index, score) pairs from one sparse row's (indices, data), sorted desc."""
+    if data.size == 0:
+        return indices[:0], data[:0]
+    if data.size > kk:
+        part = np.argpartition(-data, kk - 1)[:kk]
+    else:
+        part = np.arange(data.size)
+    order = part[np.argsort(-data[part])]
+    idx, sc = indices[order], data[order]
+    keep = sc > min_score
+    return idx[keep], sc[keep]
+
+
 def _topk_sparse(A: sparse.csr_matrix, B: sparse.csr_matrix, rows: np.ndarray, cols: np.ndarray,
                  k: int, chunk_cap: int, min_score: float = 1e-6):
-    """Yield (s1_row, pool_col, score, rank) for top-k cosine of A[rows] vs B[cols]."""
+    """Yield (s1_row, pool_col, score, rank) for top-k cosine of A[rows] vs B[cols].
+
+    Stays sparse end to end: A[r] @ Bt is a sparse product (cost tracks actual
+    shared-token overlap, not rows*cols), and top-k is taken from each row's nonzero
+    (indices, data) slice directly — never a dense (chunk_rows, len(cols)) array, which
+    at millions of pool columns would blow up memory/time regardless of chunk size.
+    """
     if len(rows) == 0 or len(cols) == 0 or k <= 0:
         return
-    Bt = B[cols].T.tocsc()
-    chunk = int(max(1, min(chunk_cap, 2e7 // max(len(cols), 1))))
+    Bt = B[cols].T.tocsr()
     kk = min(k, len(cols))
+    chunk = max(1, min(chunk_cap, 5000))
     for st in range(0, len(rows), chunk):
         r = rows[st:st + chunk]
-        S = (A[r] @ Bt).toarray()
-        idx = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
-        sc = np.take_along_axis(S, idx, axis=1)
-        order = np.argsort(-sc, axis=1)
-        idx, sc = np.take_along_axis(idx, order, 1), np.take_along_axis(sc, order, 1)
+        S = (A[r] @ Bt).tocsr()
+        indptr, indices, data = S.indptr, S.indices, S.data
         for i in range(len(r)):
-            for rank in range(kk):
-                if sc[i, rank] > min_score:
-                    yield r[i], cols[idx[i, rank]], float(sc[i, rank]), rank + 1
+            lo, hi = indptr[i], indptr[i + 1]
+            idx, sc = _row_topk(indices[lo:hi], data[lo:hi], kk, min_score)
+            for rank, (j, s) in enumerate(zip(idx, sc), 1):
+                yield r[i], cols[j], float(s), rank
 
 
 def _country_groups(ix: BlockingIndex, mode: str):
@@ -96,7 +114,17 @@ def _country_groups(ix: BlockingIndex, mode: str):
         yield np.asarray(rows), (cols if len(cols) else all_cols)
 
 
+def _sparse_row_dict(S: sparse.csr_matrix, i: int) -> dict:
+    lo, hi = S.indptr[i], S.indptr[i + 1]
+    return dict(zip(S.indices[lo:hi].tolist(), S.data[lo:hi].tolist()))
+
+
 def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
+    """score = name_overlap + 0.5*addr_overlap (idf-weighted), zeroed unless the name
+    matches or the address shares >=2 rare tokens. Kept sparse end to end (see
+    `_topk_sparse`): combining three separate sparse products per row means working
+    from each row's nonzero (index -> value) map instead of a dense (chunk, len(cols))
+    array, which at millions of pool columns is not just slow but not allocatable."""
     n = ix.token_idf["__N__"]
     max_df = cfg["rare_token_max_df"]
     idf_thresh = np.log((1 + n) / (1 + max(2, max_df * n))) + 1
@@ -108,22 +136,31 @@ def _rare_token_index(ix: BlockingIndex, cfg: dict, rows, cols):
     s1n, pn = cv.transform(ix.s1["name_core"]), cv.transform(ix.pool["name_core"])
     s1a, pa = cv.transform(ix.s1["addr_key"]), cv.transform(ix.pool["addr_key"])
     k = cfg["rare_token_k"]
-    PnT, PaT = (pn[cols] @ w).T.tocsc(), pa[cols].T.tocsc()
-    PaTw = (pa[cols] @ w).T.tocsc()
-    for st in range(0, len(rows), 1000):
-        r = rows[st:st + 1000]
-        name_s = (s1n[r] @ PnT).toarray()
-        addr_cnt = (s1a[r] @ PaT).toarray()
-        score = name_s + 0.5 * (s1a[r] @ PaTw).toarray()
-        score[(name_s <= 0) & (addr_cnt < 2)] = 0
-        kk = min(k, score.shape[1])
-        idx = np.argpartition(-score, kk - 1, axis=1)[:, :kk]
+    PnT = (pn[cols] @ w).T.tocsr()
+    PaT = pa[cols].T.tocsr()
+    PaTw = (pa[cols] @ w).T.tocsr()
+    chunk = max(1, min(cfg.get("chunk_size", 2000), 5000))
+    for st in range(0, len(rows), chunk):
+        r = rows[st:st + chunk]
+        Sname = (s1n[r] @ PnT).tocsr()
+        Sacnt = (s1a[r] @ PaT).tocsr()
+        Saw = (s1a[r] @ PaTw).tocsr()
         for i in range(len(r)):
-            sc = score[i, idx[i]]
-            order = np.argsort(-sc)
-            for rank, j in enumerate(order, 1):
-                if sc[j] > 0:
-                    yield r[i], cols[idx[i, j]], float(sc[j]), rank
+            name_row = _sparse_row_dict(Sname, i)
+            aw_row = _sparse_row_dict(Saw, i)
+            if not name_row and not aw_row:
+                continue
+            acnt_row = _sparse_row_dict(Sacnt, i)
+            scored = {}
+            for j in set(name_row) | set(aw_row):
+                ns = name_row.get(j, 0.0)
+                sc = ns + 0.5 * aw_row.get(j, 0.0)
+                if ns <= 0 and acnt_row.get(j, 0.0) < 2:
+                    continue
+                if sc > 0:
+                    scored[j] = sc
+            for rank, (j, sc) in enumerate(sorted(scored.items(), key=lambda kv: -kv[1])[:k], 1):
+                yield r[i], cols[j], float(sc), rank
 
 
 def _key_blocks(ix: BlockingIndex, cfg: dict):

@@ -174,10 +174,43 @@ def normalize_address(raw: str) -> dict:
     }
 
 
-def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Adds normalized columns; raw columns are kept for exact-string features."""
-    names = pd.DataFrame([normalize_name(x) for x in df["business_name"]], index=df.index)
-    addrs = pd.DataFrame([normalize_address(x) for x in df["business_address"]], index=df.index)
-    out = pd.concat([df, names, addrs], axis=1)
-    out["country_norm"] = df["country"].map(lambda c: base_clean(c).strip())
-    return out
+def _normalize_chunk(names: list[str], addrs: list[str], countries: list[str]):
+    names_df = pd.DataFrame([normalize_name(x) for x in names])
+    addrs_df = pd.DataFrame([normalize_address(x) for x in addrs])
+    country_norm = pd.Series([base_clean(c).strip() for c in countries], name="country_norm")
+    return names_df, addrs_df, country_norm
+
+
+def normalize_frame(df: pd.DataFrame, chunk_size: int = 50_000, n_jobs: int | None = None) -> pd.DataFrame:
+    """Adds normalized columns; raw columns are kept for exact-string features.
+
+    Processes in row-chunks (each chunk builds its own small DataFrame instead of one
+    Python list-of-dicts spanning the whole input) and, above `chunk_size` rows,
+    parallelizes chunks across processes: at multi-million-row scale a single Python
+    process doing this row-by-row is both memory- and CPU-bound.
+    """
+    n = len(df)
+    if n <= chunk_size:
+        names_df, addrs_df, country_norm = _normalize_chunk(
+            df["business_name"].tolist(), df["business_address"].tolist(), df["country"].tolist())
+        names_df.index = addrs_df.index = country_norm.index = df.index
+        return pd.concat([df, names_df, addrs_df, country_norm], axis=1)
+
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    chunks = [df.iloc[i:i + chunk_size] for i in range(0, n, chunk_size)]
+    n_jobs = n_jobs or min(4, os.cpu_count() or 1, len(chunks))
+    results = [None] * len(chunks)
+    with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+        futs = {ex.submit(_normalize_chunk, c["business_name"].tolist(),
+                          c["business_address"].tolist(), c["country"].tolist()): i
+               for i, c in enumerate(chunks)}
+        for fut in futs:
+            results[futs[fut]] = fut.result()
+
+    parts = []
+    for c, (names_df, addrs_df, country_norm) in zip(chunks, results):
+        names_df.index = addrs_df.index = country_norm.index = c.index
+        parts.append(pd.concat([c, names_df, addrs_df, country_norm], axis=1))
+    return pd.concat(parts)
