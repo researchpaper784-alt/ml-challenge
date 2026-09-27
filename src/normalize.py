@@ -181,7 +181,7 @@ def _normalize_chunk(names: list[str], addrs: list[str], countries: list[str]):
     return names_df, addrs_df, country_norm
 
 
-def normalize_frame(df: pd.DataFrame, chunk_size: int = 50_000, n_jobs: int | None = None) -> pd.DataFrame:
+def normalize_frame(df: pd.DataFrame, chunk_size: int = 150_000, n_jobs: int | None = None) -> pd.DataFrame:
     """Adds normalized columns; raw columns are kept for exact-string features.
 
     Processes in row-chunks (each chunk builds its own small DataFrame instead of one
@@ -208,8 +208,14 @@ def normalize_frame(df: pd.DataFrame, chunk_size: int = 50_000, n_jobs: int | No
     # multi-GB frame the caller already holds), which then balloons for real as each
     # worker's own refcounting touches those inherited pages. spawn starts each
     # worker as a fresh interpreter that only ever receives the pickled chunk args.
+    #
+    # max_tasks_per_child=1: without it, a worker that lives across many chunks keeps
+    # whatever memory glibc's allocator never hands back to the OS between chunks —
+    # measured at ~2GB/worker RSS after processing just a few 50k-row chunks, growing
+    # with every further chunk. A fresh process per chunk costs re-import overhead but
+    # caps memory to one chunk's worth per worker, which is the one that matters here.
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as ex:
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx, max_tasks_per_child=1) as ex:
         futs = {ex.submit(_normalize_chunk, c["business_name"].tolist(),
                           c["business_address"].tolist(), c["country"].tolist()): i
                for i, c in enumerate(chunks)}
